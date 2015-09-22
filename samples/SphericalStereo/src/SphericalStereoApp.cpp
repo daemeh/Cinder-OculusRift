@@ -20,15 +20,15 @@ using namespace std;
 struct Pano {
 	Pano() { }
 	Pano( const fs::path& path )
-		: mTopBottom( true ), mLeftFirst( true ), mName( path.filename().string() )
+		: mDisplayMode{ ivec2(0,0) }, mName( path.filename().string() )
 	{
 		std::string stem = path.stem().string();
 		std::transform( stem.begin(), stem.end(), stem.begin(), ::toupper );
 		switch( stem.back() ) {
-		case 'R': mTopBottom = false; mLeftFirst = true; break;
-		case 'L': mTopBottom = false; mLeftFirst = false; break;
-		case 'B': mTopBottom = true; mLeftFirst = true; break;
-		case 'T': mTopBottom = true; mLeftFirst = false; break;
+		case 'L': mDisplayMode = ivec2( 0, 0 ); break;
+		case 'R': mDisplayMode = ivec2( 0, 1 ); break;
+		case 'T': mDisplayMode = ivec2( 1, 0 ); break;
+		case 'B': mDisplayMode = ivec2( 1, 1 ); break;
 		default: break;
 		}
 
@@ -36,8 +36,7 @@ struct Pano {
 	}
 	gl::Texture2dRef	mLatLong;
 	std::string			mName;
-	bool				mLeftFirst;
-	bool				mTopBottom;
+	ivec2				mDisplayMode;
 };
 
 class SphericalStereoApp : public App {
@@ -50,7 +49,7 @@ public:
 	void keyDown( KeyEvent event ) override;
 	void keyUp( KeyEvent event ) override;
 
-	hmd::OculusRift	mRift;
+	hmd::OculusRiftRef	mRift;
 private:
 	
 	size_t				mPanoIndex = 0;
@@ -61,47 +60,43 @@ private:
 
 SphericalStereoApp::SphericalStereoApp()
 {
-	if( mRift.attachToWindow( getWindow() ) ) {
-		app::setWindowSize( mRift.getNativeWindowResolution() );
-		mRift.enableMonoscopic( true );
-		mRift.enablePositionalTracking( false );
-		mRift.setScreenPercentage( 1.25f );
-	}
+	mRift = hmd::OculusRift::create( hmd::OculusRift::Params()
+		.monoscopic( true )
+		.positional( false ) );
 
-	mStereoGlsl	= gl::GlslProg::create( loadAsset( "stereo.vert" ), loadAsset( "stereo.frag" ) );
+	try{
+		mStereoGlsl = gl::GlslProg::create( loadAsset( "stereo.vert" ), loadAsset( "stereo.frag" ) );
+	}
+	catch( const ci::Exception& exc ) {
+		CI_LOG_EXCEPTION( "GLSL", exc );
+	}
 	mPanos.push_back( Pano{ getAssetPath( "arnold_LR.jpg" ) } );
 	mSphere		= gl::Batch::create( geom::Icosphere().subdivisions( 2 ), mStereoGlsl );
 
 	// Generally preferable to enable vsync to prevent tearing in the headset display
-	gl::enableVerticalSync();
+	gl::enableVerticalSync( false );
 	gl::color( Color::white() );
 }
 
 void SphericalStereoApp::update()
 {
-
-}
-
-void SphericalStereoApp::draw()
-{
-	hmd::ScopedBind bind{ mRift };
-	gl::clear();
-
-	if( mRift.hasWindow( getWindow() ) ) {
-		for( auto eye : mRift.getEyes() ) {
-			mRift.enableEye( eye );
-			mStereoGlsl->uniform( "uTopDown", mPanos.at( mPanoIndex ).mTopBottom );
-			mStereoGlsl->uniform( "uLeftFirst", mPanos.at( mPanoIndex ).mLeftFirst );
-			mStereoGlsl->uniform( "uCurrentEye", static_cast<bool>( eye ) );
-			gl::ScopedTextureBind tex0( mPanos.at( mPanoIndex ).mLatLong );
+	if( mRift ) {
+		hmd::ScopedRiftBuffer bind{ mRift };
+		gl::clear();
+		for( auto eye : mRift->getEyes() ) {
+			mRift->enableEye( eye );
+			const auto& pano = mPanos.at( mPanoIndex );
+			mStereoGlsl->uniform( "uDisplayMode", pano.mDisplayMode );
+			mStereoGlsl->uniform( "uRightEye", static_cast<int>(eye) );
+			gl::ScopedTextureBind tex0( pano.mLatLong );
 			mSphere->draw();
 
 			{
-				auto size = mRift.getFboSize();
+				auto size = mRift->getFboSize();
 				gl::ScopedMatrices push;
 				gl::setMatricesWindow( size.x / 2, size.y );
-				vec3 latencies = mRift.getLatencies();
-				
+				vec3 latencies = mRift->getLatencies();
+
 				stringstream ss;
 				ss << mPanos.at( mPanoIndex ).mName << std::endl;
 				ss << " " << std::endl;
@@ -109,12 +104,17 @@ void SphericalStereoApp::draw()
 				ss << "Ren: " << latencies.x << std::endl;
 				ss << "TWrp: " << latencies.y << std::endl;
 				ss << "PostPresent: " << latencies.z << std::endl;
-				
+
 				auto tbox = TextBox().text( ss.str() ).font( Font( "Arial", 20.0f ) ).color( Color::white() ).backgroundColor( Color::black() );
 				gl::draw( gl::Texture2d::create( tbox.render() ), vec2( size.x / 3, size.y / 2 ) );
 			}
 		}
 	}
+}
+
+void SphericalStereoApp::draw()
+{
+	
 }
 
 void SphericalStereoApp::fileDrop( FileDropEvent event )
@@ -133,7 +133,16 @@ void SphericalStereoApp::keyDown( KeyEvent event )
 		quit();
 		break;
 	case KeyEvent::KEY_r:
-		mRift.recenterPose();
+		mRift->recenterPose();
+		break;
+	case KeyEvent::KEY_m:
+		mRift->enableMirrored( ! mRift->isMirrored() );
+		break;
+	case KeyEvent::KEY_s:
+		mRift->enableMonoscopic( ! mRift->isMonoscopic() );
+		break;
+	case KeyEvent::KEY_p:
+		mRift->enablePositionalTracking( ! mRift->isPositionalTrackingEnabled() );
 		break;
 	}
 }
@@ -147,6 +156,5 @@ CINDER_APP( SphericalStereoApp, RendererGl( RendererGl::Options().msaa( 0 ) ), [
 	hmd::RiftManager::initialize();
 	settings->disableFrameRate();
 	settings->setTitle( "Oculus Rift Sample" );
-	settings->setWindowPos( ivec2( 0 ) );
-	settings->setWindowSize( 1920, 1080 );
+	settings->setWindowSize( 1920/2, 1080/2 );
 } )

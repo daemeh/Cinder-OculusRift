@@ -42,9 +42,10 @@
 #include "cinder/app/Window.h"
 #include "cinder/gl/gl.h"
 #include "cinder/Camera.h"
+#include "cinder/Exception.h"
+#include "cinder/Noncopyable.h"
 
-#include "OVR_CAPI_0_5_0.h"
-#include "OVR_Version.h"
+#include "OVR_CAPI.h"
 #include "OVR_CAPI_GL.h"
 
 #include <map>
@@ -147,6 +148,98 @@ static const glm::vec3 kLeapToRiftEuler = glm::vec3( -0.5f * (float)M_PI, 0, (fl
 
 ////////////////////////////////////////////////////////////////////////
 
+
+// TODO: Cinder gl::Fbos currently don't allow for changing the texture attachments at every frame.
+// We thus use the provided sample implementation by Oculus.
+
+//---------------------------------------------------------------------------------------
+struct DepthBuffer
+{
+	GLuint        texId;
+
+	DepthBuffer( glm::ivec2 size, int sampleCount )
+	{
+		CI_ASSERT( sampleCount <= 1 ); // The code doesn't currently handle MSAA textures.
+
+		glGenTextures( 1, &texId );
+		glBindTexture( GL_TEXTURE_2D, texId );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+		glTexImage2D( GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, size.x, size.y, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL );
+	}
+
+	~DepthBuffer() {
+		glDeleteTextures( 1, &texId );
+	}
+};
+
+//--------------------------------------------------------------------------
+struct TextureBuffer
+{
+	ovrSwapTextureSet* TextureSet;
+	GLuint        texId;
+	GLuint        fboId;
+	glm::ivec2         texSize;
+
+	TextureBuffer( ovrHmd hmd, glm::ivec2 size, int mipLevels, int sampleCount )
+	{
+		CI_ASSERT( sampleCount <= 1 ); // The code doesn't currently handle MSAA textures.
+		texSize = size;
+
+		// This texture isn't necessarily going to be a rendertarget, but it usually is.
+		CI_ASSERT( hmd ); // No HMD? A little odd.
+		CI_ASSERT( sampleCount == 1 ); // ovrHmd_CreateSwapTextureSetD3D11 doesn't support MSAA.
+
+		auto result = ovr_CreateSwapTextureSetGL( hmd, GL_SRGB8_ALPHA8, size.x, size.y, &TextureSet );
+		CI_ASSERT( result == ovrSuccess );
+
+		for( int i = 0; i < TextureSet->TextureCount; ++i ) {
+			ovrGLTexture* tex = (ovrGLTexture*)&TextureSet->Textures[i];
+			glBindTexture( GL_TEXTURE_2D, tex->OGL.TexId );
+			glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+			glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+			glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+			glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+		}
+
+		if( mipLevels > 1 ) {
+			glGenerateMipmap( GL_TEXTURE_2D );
+		}
+
+		glGenFramebuffers( 1, &fboId );
+	}
+
+	~TextureBuffer() {
+		glDeleteFramebuffers( 1, &fboId );
+	}
+
+	glm::ivec2 getSize() const
+	{
+		return texSize;
+	}
+
+	void setAndClearRenderSurface( DepthBuffer * dbuffer )
+	{
+		ovrGLTexture* tex = (ovrGLTexture*)&TextureSet->Textures[TextureSet->CurrentIndex];
+
+		glBindFramebuffer( GL_FRAMEBUFFER, fboId );
+		glFramebufferTexture2D( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex->OGL.TexId, 0 );
+		glFramebufferTexture2D( GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, dbuffer->texId, 0 );
+
+		glViewport( 0, 0, texSize.x, texSize.y );
+		glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
+	}
+
+	void unsetRenderSurface()
+	{
+		glBindFramebuffer( GL_FRAMEBUFFER, fboId );
+		glFramebufferTexture2D( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0 );
+		glFramebufferTexture2D( GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0 );
+	}
+};
+
 class OculusRift;
 
 class RiftManager : public ci::Noncopyable 
@@ -159,29 +252,42 @@ private:
 	static std::once_flag				mOnceFlag;
 	static std::unique_ptr<RiftManager>	mInstance;
 
-	friend class OculusRift;
+	friend OculusRift;
 };
 
-class OculusRift 
+typedef std::shared_ptr<OculusRift> OculusRiftRef;
+
+class OculusRift : ci::Noncopyable
 {
 public:
-	explicit OculusRift();
+	struct Params {
+		Params() : mHostCam{ false, ci::CameraPersp{} } { }
+		Params& screenPercentage( float sp ) { mScreenPercentage = sp; return *this; }
+		Params& hostCamera( const ci::CameraPersp& host ) { mHostCam = { true, host }; return *this; }
+		Params& monoscopic( bool mono ) { mIsMonoscopic = mono; return *this; }
+		Params& mirrored( bool mirror ) { mIsMirrrored = mirror; return *this; }
+		Params& positional( bool tracked ) { mUsePositionalTracking = tracked; return *this; }
+	private:
+		std::pair<bool, ci::CameraPersp> mHostCam;
+		float mScreenPercentage = 1.3f;
+		bool mIsMonoscopic = false;
+		bool mIsMirrrored = true;
+		bool mUsePositionalTracking = true;
+		friend OculusRift;
+	};
+
+
+	static OculusRiftRef create( const Params& params = Params{} );
 	~OculusRift();
-	
-	bool	attachToWindow( const ci::app::WindowRef &window );
-	void	detachFromWindow();
-
 	//! Binds the final framebuffer used by the OVR runtime.
-	void	bind() const;
+	void	bind();
 	//! Unbinds the framebuffer.
-	void	unbind() const;
-
-	//! Set the base viewpoint position and orientation through the host camera.
-	void	setHostCamera( const ci::CameraPersp& camera ) { mHostCamera = camera; }
+	void	unbind();
 
 	//! Returns the convenience host camera (base viewpoint position and orientation).
-	ci::CameraPersp&		getHostCamera() { return mHostCamera; }
 	const ci::CameraPersp&	getHostCamera() const { return mHostCamera; }
+	//! Set the base viewpoint position and orientation through the host camera. (Affects the model matrix.)
+	void	setHostCamera( const ci::CameraPersp& camera ) { mModelMatrixCached = false; mHostCamera = camera; }
 
 	//! Enable the current rendered eye, applies the viewport and mvp matrices directly (optionally disabled). 
 	void	enableEye( int eyeIndex, bool applyMatrices = true );
@@ -189,8 +295,7 @@ public:
 	std::list<ovrEyeType>	getEyes() const;
 
 	//! Returns the active eye camera.
-	ci::CameraPersp&		getEyeCamera() { return mHmdEyeCamera; }
-	const ci::CameraPersp&	getEyeCamera() const { return mHmdEyeCamera; }
+	const ci::CameraPersp&	getEyeCamera() const { return mEyeCamera; }
 
 	/*! Re-centers the sensor orientation.
 	 * Normally this will recenter the (x,y,z) translational components and the yaw
@@ -209,49 +314,51 @@ public:
 	 * render helps minimize aliasing and increases detail. */
 	void	setScreenPercentage( float sp );
 
-	//! Returns true if the render is also mirrored on screen (direct mode).
+	//! Returns true if the render is also mirrored on screen.
 	bool	isMirrored() const;
-	//! Enable mirroring to screen (direct mode).
+	//! Enable mirroring to screen.
 	void	enableMirrored( bool enabled );
 
 	//! Returns true if monoscopic (no offset between eyes).
 	bool	isMonoscopic() const { return mIsMonoscopic; }
 	/*! Enabling monoscopic will eliminate offsets between each eye,
 	 * thus eliminating any 3d stereoscopic effect. */
-	void	enableMonoscopic( bool enabled ) { mIsMonoscopic = enabled; }
+	void	enableMonoscopic( bool enabled );
+
+	//! Updates horizontal offset between the eyes depending on mono vs stereo rendering.
+	void	updateEyeOffset();
 
 	//! Returns true if the positional tracking translations are applied.
 	bool	isTracked() const;
+	bool	isTracked( const ovrTrackingState& ts ) const;
 	//! Returns if positional tracking is enabled.
 	bool	isPositionalTrackingEnabled() const { return mUsePositionalTracking; }
 	//! Enabling the use of positional tracking translations.
 	void	enablePositionalTracking( bool enabled ) { mUsePositionalTracking = enabled; }
 
-	//! Scale the head scale factor (based in meters)
-	void	setHeadScale( float scale );
+	/*! OPTIONAL: ovrSuccess_NotVisible is returned if the frame wasn't actually displayed, which can happen when VR
+	application loses focus. Our sample code handles this case by updating the isFrameSkipped flag.
+	While frames are not visible, rendering is paused to eliminate unnecessary GPU load. */
+	bool	isFrameSkipped() const { return mSkipFrame; }
 
-	//! Returns the native window position of the HMD.
-	glm::ivec2	getNativeWindowPos() const { return fromOvr( mHmd->WindowsPos ); }
 	//! Returns the native resolution of the HMD.
-	glm::ivec2	getNativeWindowResolution() const { return fromOvr( mHmd->Resolution ); }
+	glm::ivec2	getNativeHmdResolution() const { return fromOvr( mHmdDesc.Resolution ); }
 	//! Returns the size of the render target fbo (used by both eyes).
-	glm::ivec2	getFboSize() const { return mFbo->getSize(); }
+	glm::ivec2	getFboSize() const { return mRenderBuffer->getSize(); }
 
-	//! Returns the composed host and (active) eye view matrix.
-	glm::mat4	getViewMatrix() const;
-	//! Returns the composed host and (active) eye inverse view matrix.
-	glm::mat4	getInverseViewMatrix() const;
+	//! Returns the host camera view matrix, which acts as the rift model matrix.
+	inline glm::mat4	getModelMatrix() const;
+	//! Returns the active eye's view matrix.
+	inline glm::mat4	getViewMatrix() const;
 	//! Returns the composed host and (active) eye projection matrix.
 	glm::mat4	getProjectionMatrix() const;
 	//! Returns the active eye viewport.
-	std::pair<glm::ivec2, glm::ivec2> getEyeViewport() const { return fromOvr( mEyeTexture[mEye].OGL.Header.RenderViewport ); }
+	std::pair<glm::ivec2, glm::ivec2> getEyeViewport() const { return fromOvr( mBaseLayer.Viewport[mEye] ); }
 
-	bool hasWindow( const ci::app::WindowRef &window ) const { return mWindow == window; }
-//	bool isCaptured() const;
-	bool isDesktopExtended() const;
 private:
+	explicit OculusRift( const Params& params );
 
-	class HmdEyeCamera : public ci::CameraPersp 
+	class EyeCamera : public ci::CameraPersp 
 	{
 	protected:
 		void calcProjection() const override
@@ -265,61 +372,59 @@ private:
 		friend class OculusRift;
 	};
 	
-	static bool	isValid( const ci::app::WindowRef& window );
-	
-	void	updateHmdSettings();
-	void	dismissHSW();
 	void	initializeFrameBuffer();
-	void	startDrawFn( ci::app::Renderer *renderer );
-	void	finishDrawFn( ci::app::Renderer *renderer );
+	void	initializeMirrorTexture( const glm::ivec2& size );
+	void	calcEyePoses();
+	void	submitFrame();
 	
-
+	mutable glm::mat4	mModelMatrix;
+	mutable bool		mModelMatrixCached = false;
 	mutable glm::mat4	mProjectionMatrix;
 	mutable bool		mProjectionCached = false;
 	mutable glm::mat4	mViewMatrix, mInverseViewMatrix;
 	mutable bool		mViewMatrixCached = false;
 	mutable bool		mInverseViewMatrixCached = false;
 
-	ci::app::WindowRef	mWindow;
-	ci::gl::FboRef		mFbo;
-
-	HmdEyeCamera		mHmdEyeCamera;
+	EyeCamera			mEyeCamera;
 	ci::CameraPersp		mHostCamera;
 
 	float				mHeadScale;
 	float				mScreenPercentage;
-	unsigned int		mDistortionCaps, mHmdCaps, mTrackingCaps;
-	bool				mHmdSettingsChanged;
+	unsigned int		mTrackingCaps;
+	bool				mIsMirrrored;
 	bool				mIsMonoscopic;
 	bool				mUsePositionalTracking;
 
+	bool				mSkipFrame;
+
 	// Oculus Rift SDK
 	ovrHmd				mHmd;
+	ovrHmdDesc			mHmdDesc;
+	ovrEyeType			mEye;
 	ovrEyeRenderDesc	mEyeRenderDesc[ovrEye_Count];
 	ovrPosef			mEyeRenderPose[ovrEye_Count];
 	ovrVector3f			mEyeViewOffset[ovrEye_Count];
-	ovrRecti			mEyeViewport[ovrEye_Count];
-	ovrGLTexture		mEyeTexture[ovrEye_Count];
-	ovrVector2f			mUVScaleOffset[ovrEye_Count][2];
-	ovrTrackingState	mTrackingState;
-	ovrEyeType			mEye;
+	ovrLayerEyeFov		mBaseLayer;
 
-	class ModeImpl;
-	class DirectModeImpl;
-	class ExtendedModeImpl;
+	std::unique_ptr<TextureBuffer>	mRenderBuffer;
+	std::unique_ptr<DepthBuffer>	mDepthBuffer;
 
-	std::unique_ptr<ModeImpl> mImpl;
-
-	friend class OculusRift::DirectModeImpl;
-	friend class OculusRift::ExtendedModeImpl;
+	ovrGLTexture*					mMirrorTexture;
+	GLuint							mMirrorFBO;
 };
 
-struct ScopedBind
+struct ScopedRiftBuffer
 {
-	ScopedBind( OculusRift& rift );
-	~ScopedBind();
+	ScopedRiftBuffer( const OculusRiftRef& rift );
+	~ScopedRiftBuffer();
 private:
 	OculusRift* mRift;
+};
+
+class RiftExeption : public ci::Exception {
+public:
+	RiftExeption() { }
+	RiftExeption( const std::string &description ) : Exception( description ) { }
 };
 
 } // namespace hmd

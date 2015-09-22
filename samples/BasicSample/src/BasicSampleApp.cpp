@@ -12,6 +12,7 @@
 using namespace ci;
 using namespace ci::app;
 using namespace std;
+using namespace hmd;
 
 class BasicSampleApp : public App {
 public:
@@ -23,11 +24,12 @@ public:
 
 	void keyDown( KeyEvent event ) override;
 private:
+	void drawScene();
 	double			mTime;
 
 	CameraPersp			mCamera;
 	CameraUi			mCameraUi;
-	hmd::OculusRift		mRift;
+	OculusRiftRef		mRift;
 
 	gl::GlslProgRef	mShader;
 	gl::BatchRef	mTeapot;
@@ -40,25 +42,7 @@ BasicSampleApp::BasicSampleApp()
 : mViewerPosition{ vec3( 0, 0, 1 ) }
 , mCameraUi( &mCamera, app::getWindow() )
 {
-	if( mRift.attachToWindow( getWindow() ) ) {
-		if( mRift.isDesktopExtended() )
-			app::setFullScreen();
-		else
-			app::setWindowSize( mRift.getNativeWindowResolution() );
-		CameraPersp host;
-		host.setEyePoint( mViewerPosition );
-		host.lookAt( vec3( 0 ) );
-		mRift.setHostCamera( host );
-		mRift.setScreenPercentage( 1.25f );
-	}
-	
-	try {
-		mShader = gl::GlslProg::create( gl::GlslProg::Format().vertex( loadAsset( "phong.vert" ) ).fragment( loadAsset( "phong.frag" ) ) );
-	}
-	catch( const std::exception& e ) {
-		console() << e.what() << std::endl;
-		quit();
-	}
+	mShader = gl::GlslProg::create( gl::GlslProg::Format().vertex( loadAsset( "phong.vert" ) ).fragment( loadAsset( "phong.frag" ) ) );
 	mTeapot = gl::Batch::create( geom::Teapot().subdivisions( 12 ), mShader );
 
 	// Setup camera for the debug (main) window.
@@ -66,11 +50,17 @@ BasicSampleApp::BasicSampleApp()
 	mCamera.lookAt( vec3( 0 ) );
 	mCamera.setFov( 45.0f );
 
-	// Generally preferable to enable vsync to prevent tearing in the headset display
-	gl::enableVerticalSync();
+	gl::disableAlphaBlending();
 	gl::enableDepthRead();
 	gl::enableDepthWrite();
 	gl::color( Color::white() );
+
+	try {
+		mRift = OculusRift::create( OculusRift::Params().screenPercentage( 1.4f ) );
+	}
+	catch( const RiftExeption& exc ) {
+		CI_LOG_EXCEPTION( "Failed rift initialization.", exc );
+	}
 }
 
 void BasicSampleApp::update()
@@ -78,54 +68,65 @@ void BasicSampleApp::update()
 	// Animate light position.
 	mTime = getElapsedSeconds();
 	float t = float( mTime ) * 0.4f;
-	mLightWorldPosition = vec4( 1.0f * math<float>::sin( t ), math<float>::sin( t * 4.0f ), 1.0f * math<float>::cos( t ), 1 );
-}
+	mLightWorldPosition = vec4( math<float>::sin( t ), math<float>::sin( t * 4.0f ), math<float>::cos( t ), 1 );
 
-void BasicSampleApp::draw()
-{
-	hmd::ScopedBind bind{ mRift };
+	// Move head location
+	if( mRift ) {
+		auto host = mRift->getHostCamera();
+		host.setEyePoint( mViewerPosition + vec3( 0.5f * sin( app::getElapsedSeconds() ), 0, 0 ) );
+		host.lookAt( vec3( 0 ) );
+		mRift->setHostCamera( host );
+	}
+
+	// Draw from update due to conflicting WM_PAINT signal emitted by ovr_submitFrame (0.7 SDK).
 	gl::clear( Color( 0.02, 0.02, 0.1 ) );
+	if( mRift && ! mRift->isFrameSkipped() ) {
+		ScopedRiftBuffer bind{ mRift };
 
-	auto sceneDraw = [&]() {
-		{
-			gl::ScopedModelMatrix push;
-			gl::rotate( (float)mTime, vec3( -0.3f, -1.0f, 0.2f ) );
-			gl::scale( vec3( 0.5f ) );
-			gl::translate( 0.0f, -0.5f, 0.0f );
-			mTeapot->draw();
-		}
-		
-		gl::lineWidth( 3.0f );
-		gl::drawCoordinateFrame( 2 );
-		gl::drawSphere( vec3( mLightWorldPosition ), 0.05f, 36 );
-	};
+		for( auto eye : mRift->getEyes() ) {
+			mRift->enableEye( eye );
+			mShader->uniform( "uLightViewPosition", mRift->getViewMatrix() * mLightWorldPosition );
+			mShader->uniform( "uSkyDirection", mRift->getViewMatrix() * vec4( 0, 1, 0, 0 ) );
 
-	if( mRift.hasWindow( getWindow() ) ) {
-		for( auto eye : mRift.getEyes() ) {
-			mRift.enableEye( eye );
-			
-			mShader->uniform( "uLightViewPosition", mRift.getViewMatrix() * mLightWorldPosition );
-			mShader->uniform( "uSkyDirection", mRift.getViewMatrix() * vec4( 0, 1, 0, 0 ) );
-			sceneDraw();
-			
+			drawScene();
+
 			// Draw positional tracking camera frustum
 			CameraPersp positional;
-			if( mRift.getPositionalTrackingCamera( &positional ) ) {
-				gl::ScopedModelMatrix push;
-				gl::setModelMatrix( mRift.getHostCamera().getInverseViewMatrix() );
+			if( mRift->getPositionalTrackingCamera( &positional ) ) {
+				gl::setModelMatrix( mat4() );
 				gl::lineWidth( 1.0f );
 				gl::drawFrustum( positional );
 			}
 		}
-	} else {
+	}
+}
+
+void BasicSampleApp::drawScene()
+{
+	{
+		gl::ScopedModelMatrix push;
+		gl::rotate( (float)mTime, vec3( -0.3f, -1.0f, 0.2f ) );
+		gl::scale( vec3( 0.5f ) );
+		gl::translate( 0.0f, -0.5f, 0.0f );
+		mTeapot->draw();
+	}
+
+	gl::lineWidth( 3.0f );
+	gl::drawCoordinateFrame( 2 );
+	gl::drawSphere( vec3( mLightWorldPosition ), 0.05f, 36 );
+}
+
+void BasicSampleApp::draw()
+{
+	if( ! mRift ) {
 		gl::viewport( getWindowSize() );
 		gl::setMatrices( mCamera );
-		
+
 		const mat4& view = mCamera.getViewMatrix();
 		mShader->uniform( "uLightViewPosition", view * mLightWorldPosition );
 		mShader->uniform( "uSkyDirection", view * vec4( 0, 1, 0, 0 ) );
 
-		sceneDraw();
+		drawScene();
 	}
 }
 
@@ -141,27 +142,30 @@ void BasicSampleApp::keyDown( KeyEvent event )
 		quit();
 		break;
 	case KeyEvent::KEY_r:
-		mRift.recenterPose();
+		mRift->recenterPose();
 		break;
 	case KeyEvent::KEY_m:
-		mRift.enableMirrored( ! mRift.isMirrored() );
+		mRift->enableMirrored( ! mRift->isMirrored() );
 		break;
 	case KeyEvent::KEY_s:
-		mRift.enableMonoscopic( ! mRift.isMonoscopic() );
+		mRift->enableMonoscopic( ! mRift->isMonoscopic() );
 		break;
 	case KeyEvent::KEY_t:
-		mRift.enablePositionalTracking( ! mRift.isTracked() );
+		mRift->enablePositionalTracking( ! mRift->isPositionalTrackingEnabled() );
 		break;
 	}
 }
 
 void prepareSettings( App::Settings *settings )
 {
-	hmd::RiftManager::initialize();
-	
-	settings->disableFrameRate();
+	try{
+		RiftManager::initialize();
+	}
+	catch( const RiftExeption& exc ) {
+		CI_LOG_EXCEPTION( "Failed ovr initialization", exc );
+	}
 	settings->setTitle( "Oculus Rift Sample" );
-	settings->setWindowSize( 1920, 1080 );
+	settings->setWindowSize( 1920/2, 1080/2 );
 }
 
 CINDER_APP( BasicSampleApp, RendererGl( RendererGl::Options().msaa(0) ), prepareSettings );

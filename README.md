@@ -1,7 +1,7 @@
 Cinder-OculusRift
 ==================
 
-This is yet another Oculus Rift block for Cinder, and a collaboration between [Paul Houx](https://github.com/paulhoux) & myself. *Thanks Paul for all the initial work!* It currently uses version 0.4.4 of the Oculus SDK, and the latest glNext Cinder version. It has been tested with the DK2 only. Both Windows & Mac OS X are supported, although Windows (with direct-mode enabled) is still the prefered platform.
+This is yet another Oculus Rift block for Cinder, and a collaboration between [Paul Houx](https://github.com/paulhoux) & myself. *Thanks Paul for all the initial work!* It currently uses version 0.7 of the Oculus SDK, and the latest glNext Cinder version. Support for DK2 Windows.
 
 Samples
 -----------------
@@ -15,31 +15,35 @@ Samples
 
 Usage
 -----------------
-First, initialize the rift manager in prepareSettings. *Also make sure to disable both framerate and msaa 16.*
+First, initialize the rift manager in prepareSettings.
 
 ```
-hmd::RiftManager::initialize();
+using namespace hmd;
+
+RiftManager::initialize();
 ```
 
-Create an Oculus Rift instance, and attach it to a window (with vsync enabled preferably).
+Create an Oculus Rift instance:
 ```
-hmd::OculusRift		mRift;
+OculusRiftRef	mRift;
 ...
-mRift.attachToWindow( app::getWindow() )
+mRift = OculusRift::create();
 ```
 
 The OculusRift class has two cameras: a convenience host camera controlling the overall head position & orientation, and an active eye camera which is updated by the SDK according to the tracked position & orientation. Their transformations are composed and can be queried via the `hmd::OculusRift` interface.
 
 
-In the draw() loop, call bind to render the scene to the rift's framebuffer. Iterate over each eye (enabling it) and draw your scene as follows:
+In the update()** loop, call bind to render the scene to the rift's framebuffers. Iterate over each eye (enabling it) and draw your scene as follows:
 ```
-hmd::ScopedBind bind{ mRift };
+ScopedRiftBuffer bind{ mRift };
 ...
 for( auto eye : mRift.getEyes() ) {
 		mRift.enableEye( eye );
 		drawScene();
 }
 ```
+
+_*The draw code must be called from the update() loop due to a [bug in the latest SDK](https://forums.oculus.com/viewtopic.php?f=20&t=25930)._
 
 To avoid judder, make sure you hit **75fps**!
 
